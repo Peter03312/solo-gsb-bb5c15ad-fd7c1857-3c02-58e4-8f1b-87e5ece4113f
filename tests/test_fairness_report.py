@@ -428,6 +428,69 @@ def test_default_weight_is_one():
     }
 
 
+# ---------- 微小正权重（回归：不得舍入成 0 后除零） ----------
+
+def test_tiny_positive_weights_not_rounded_to_zero():
+    # 两个主体权重 1e-10 / 2e-10、各放行 cost=1：旧实现把响应权重 _round 成 0
+    # 后送进加权 Jain 公式，Σx²/w 除零崩溃，理论份额也误报为 0。
+    resp = _run(
+        [{"id": "A", "capacity": 10, "refill_rate": 0}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "a", "weight": 1e-10},
+            {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "b", "weight": 2e-10},
+        ],
+        window_seconds=10,
+    )
+    # 理论份额按未舍入权重 1:2 切分总消耗 2 -> 2/3 与 4/3
+    expected_jain = pytest.approx(8 / 9, abs=1e-9)
+    for scope in [resp.global_report, resp.window_reports[0]]:
+        assert scope.allowed_consumption == 2
+        assert scope.weighted_jain_index == expected_jain
+        a = _principal(scope, "a")
+        b = _principal(scope, "b")
+        # 响应保留正权重的有效值，而非舍入后的 0
+        assert a.weight == 1e-10 and b.weight == 2e-10
+        assert a.theoretical_share == pytest.approx(2 / 3, abs=1e-9)
+        assert b.theoretical_share == pytest.approx(4 / 3, abs=1e-9)
+        assert a.deficit == 0
+        assert b.deficit == pytest.approx(1 / 3, abs=1e-9)
+        assert b.deficit_ratio == pytest.approx(0.25, abs=1e-9)
+        # 均无被拒请求 -> 无最受限主体
+        assert scope.most_constrained_principal is None
+        assert scope.first_shortfall is None
+
+
+def test_tiny_weights_with_rejection_still_picks_constrained():
+    # 微小权重下容量仅够 1 笔：a 放行、b 被拒；份额 2/3 vs 4/3，b 短缺比例 1
+    resp = _run(
+        [{"id": "A", "capacity": 1, "refill_rate": 0}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "a", "weight": 1e-10},
+            {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "b", "weight": 2e-10},
+        ],
+        window_seconds=10,
+    )
+    g = resp.global_report
+    assert g.allowed_consumption == 1
+    # (x=(1,0), w=(1e-10,2e-10))：1 / (3e-10 · 1/1e-10) = 1/3
+    assert g.weighted_jain_index == pytest.approx(1 / 3, abs=1e-9)
+    assert g.most_constrained_principal == "b"
+    assert g.first_shortfall.request_id == "r2"
+    assert g.first_shortfall.available == 0
+    b = _principal(g, "b")
+    assert b.weight == 2e-10 and b.theoretical_share == pytest.approx(2 / 3, abs=1e-9)
+    assert b.deficit_ratio == 1
+
+
+def test_jain_index_zero_only_when_all_allocations_zero():
+    # 单主体获得量为极小正值（>0）时指数应为 1，而不是按 EPS 误判成 0
+    assert _weighted_jain_index([1e-12], [1e-12]) == 1.0
+    assert _weighted_jain_index([1e-12], [5.0]) == 1.0
+    assert _weighted_jain_index([1e-12, 2e-12], [1e-10, 2e-10]) == 1.0
+    # 仅实际获得量恰好为 0 时定义为 0（权重为任意正数都不除零）
+    assert _weighted_jain_index([0.0, 0.0], [1e-10, 2e-10]) == 0.0
+
+
 # ---------- 校验 ----------
 
 def test_principal_must_be_nonempty_string():
@@ -478,6 +541,40 @@ def test_inconsistent_principal_weight_rejected():
             }
         )
     assert any(e["type"] == "inconsistent_principal_weight" for e in exc.value.errors)
+
+
+def test_inconsistent_tiny_weights_rejected_by_true_value():
+    # 回归：1e-10 与 2e-10 真实数值相差一倍，不能因固定绝对容差（EPS=1e-9）
+    # 误判一致；错误须定位到请求 weight 字段。
+    with pytest.raises(RequestValidationErrors) as exc:
+        FairnessReportRequest.model_validate(
+            {
+                "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+                "requests": [
+                    {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+                    {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "p", "weight": 2e-10},
+                ],
+                "window_seconds": 1,
+            }
+        )
+    errors = [e for e in exc.value.errors if e["type"] == "inconsistent_principal_weight"]
+    assert len(errors) == 1
+    assert errors[0]["loc"] == ("requests", 1, "weight")
+    assert errors[0]["input"] == 2e-10
+
+
+def test_repeated_tiny_weight_is_consistent():
+    # 同一主体多次给出相同的微小权重（真实数值相同）必须正常通过
+    resp = _run(
+        [{"id": "A", "capacity": 10, "refill_rate": 0}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+            {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+        ],
+        window_seconds=10,
+    )
+    assert resp.global_report.principals[0].weight == 1e-10
+    assert resp.global_report.weighted_jain_index == 1.0
 
 
 def test_shared_validation_still_applies():
@@ -607,6 +704,45 @@ def test_http_inconsistent_weight_is_422():
         e["type"] == "inconsistent_principal_weight"
         for e in response.json()["detail"]
     )
+
+
+def test_http_inconsistent_tiny_weight_is_422():
+    response = client.post(
+        "/fairness-report",
+        json={
+            "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+            "requests": [
+                {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+                {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "p", "weight": 2e-10},
+            ],
+            "window_seconds": 1,
+        },
+    )
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert any(e["type"] == "inconsistent_principal_weight" for e in errors)
+    # 定位到第二个请求的 weight
+    hit = next(e for e in errors if e["type"] == "inconsistent_principal_weight")
+    assert hit["loc"] == ["requests", 1, "weight"]
+
+
+def test_http_tiny_positive_weights_ok():
+    response = client.post(
+        "/fairness-report",
+        json={
+            "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+            "requests": [
+                {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "a", "weight": 1e-10},
+                {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "b", "weight": 2e-10},
+            ],
+            "window_seconds": 10,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    weights = {p["principal"]: p["weight"] for p in data["global_report"]["principals"]}
+    assert weights == {"a": 1e-10, "b": 2e-10}
+    assert data["global_report"]["weighted_jain_index"] == pytest.approx(8 / 9, abs=1e-9)
 
 
 def test_http_missing_principal_is_422():
