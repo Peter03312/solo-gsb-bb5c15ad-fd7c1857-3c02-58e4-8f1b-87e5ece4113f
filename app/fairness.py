@@ -9,6 +9,10 @@
 - 找出短缺比例最高且有被拒请求的最受限 principal，以及按处理顺序
   首个造成其短缺的拒绝（链上第一个余额不足的桶）。
 
+权重总和、理论份额、短缺比例与加权 Jain 指数一律使用请求给出的未舍入
+权重与未舍入的实际获得量计算；合法的微小正权重（如 1e-10）不会被输出
+精度舍入为 0。仅在该范围实际获得量合计为 0 时把 Jain 指数定义为 0。
+
 统计同时给出跨全部窗口的全局报告与逐窗口报告。
 """
 from __future__ import annotations
@@ -32,19 +36,17 @@ def _weighted_jain_index(allocations: list[float], weights: list[float]) -> floa
     """加权 Jain 公平指数：(Σx)² / (Σw · Σx²/w)。
 
     等权重时退化为经典 Jain 指数 (Σx)² / (n·Σx²)。份额完全按权重比例时
-    取最大值 1；全部主体获得量为 0 时定义为 0（无可分配量，无公平性可言）。
+    取最大值 1；全部主体实际获得量为 0 时定义为 0（无可分配量，无公平性
+    可言）。入参必须是未舍入的实际获得量与未舍入的正权重——输出精度的
+    舍入会把合法微小正权重（如 1e-10）抹成 0，导致除零或份额失真。
     """
     total_x = sum(allocations)
-    if total_x <= EPS:
+    if total_x == 0.0:
         return 0.0
     total_w = sum(weights)
-    weighted_squares = sum(
-        (x * x) / w for x, w in zip(allocations, weights) if x > EPS
-    )
-    denominator = total_w * weighted_squares
-    if denominator <= EPS:
-        return 0.0
-    return _round(min(1.0, max(0.0, (total_x * total_x) / denominator)))
+    # 权重经输入校验恒为正，此处无需 EPS 过滤：x=0 的项对 Σx²/w 贡献本就为 0。
+    weighted_squares = sum((x * x) / w for x, w in zip(allocations, weights))
+    return _round(min(1.0, max(0.0, (total_x * total_x) / (total_w * weighted_squares))))
 
 
 def fairness_report(payload: FairnessReportRequest) -> FairnessReportResponse:
@@ -185,48 +187,54 @@ def fairness_report(payload: FairnessReportRequest) -> FairnessReportResponse:
         total_consumption = sum(consumption.values())
         total_weight = sum(principal_weight[p] for p in members)
 
+        # 未舍入的逐主体量：份额/短缺/短缺比例/Jain 与最受限主体裁决全部基于
+        # 真实权重与实际获得量。合法微小正权重（如 1e-10）小于输出舍入精度
+        # （_ROUND_DIGITS=9），若先 _round 再参与计算会被抹成 0，导致理论份额
+        # 为 0、Jain 除零；_round 只用于最终展示字段。
+        raw_got = {p: consumption.get(p, 0.0) for p in members}
+        raw_share = {
+            p: total_consumption * principal_weight[p] / total_weight for p in members
+        }
+        raw_deficit = {p: max(0.0, raw_share[p] - raw_got[p]) for p in members}
+        raw_deficit_ratio = {
+            p: (raw_deficit[p] / raw_share[p] if raw_share[p] > 0.0 else 0.0)
+            for p in members
+        }
+
         rows: list[FairnessPrincipalRow] = []
         for p in members:
-            share = (
-                total_consumption * principal_weight[p] / total_weight
-                if total_weight > EPS
-                else 0.0
-            )
-            got = consumption.get(p, 0.0)
-            deficit = max(0.0, share - got)
-            deficit_ratio = deficit / share if share > EPS else 0.0
             rows.append(
                 FairnessPrincipalRow(
                     principal=p,
-                    weight=_round(principal_weight[p]),
+                    weight=principal_weight[p],
                     request_count=req_counts.get(p, 0),
                     allowed_count=allow_counts.get(p, 0),
                     rejected_count=reject_counts.get(p, 0),
-                    allowed_consumption=_round(got),
-                    theoretical_share=_round(share),
-                    deficit=_round(deficit),
-                    deficit_ratio=_round(deficit_ratio),
+                    allowed_consumption=_round(raw_got[p]),
+                    theoretical_share=_round(raw_share[p]),
+                    deficit=_round(raw_deficit[p]),
+                    deficit_ratio=_round(raw_deficit_ratio[p]),
                 )
             )
 
         jain = _weighted_jain_index(
-            [r.allowed_consumption for r in rows],
-            [r.weight for r in rows],
+            [raw_got[p] for p in members],
+            [principal_weight[p] for p in members],
         )
 
         # 最受限主体：在有被拒请求的主体中取短缺比例最高者；
-        # 全部获得量为 0（share 为 0）时，被拒主体按彻底短缺（比例 1）处理。
-        candidates = [r for r in rows if r.rejected_count > 0]
-        starved = total_consumption <= EPS and bool(candidates)
+        # 全部实际获得量为 0（份额为 0）时，被拒主体按彻底短缺（比例 1）处理。
+        candidates = [p for p in members if reject_counts.get(p, 0) > 0]
+        starved = total_consumption == 0.0 and bool(candidates)
 
-        def shortage_key(row: FairnessPrincipalRow) -> tuple[float, int]:
-            ratio = 1.0 if starved else row.deficit_ratio
-            return (-ratio, first_seen[row.principal])
+        def shortage_key(p: str) -> tuple[float, int]:
+            ratio = 1.0 if starved else raw_deficit_ratio[p]
+            return (-ratio, first_seen[p])
 
-        most_constrained: FairnessPrincipalRow | None = None
+        most_constrained: str | None = None
         if candidates:
             ranked = min(candidates, key=shortage_key)
-            if starved or ranked.deficit_ratio > EPS:
+            if starved or raw_deficit_ratio[ranked] > 0.0:
                 most_constrained = ranked
 
         return FairnessScopeReport(
@@ -236,13 +244,9 @@ def fairness_report(payload: FairnessReportRequest) -> FairnessReportResponse:
             rejected_count=sum(reject_counts.values()),
             allowed_consumption=_round(total_consumption),
             weighted_jain_index=jain,
-            most_constrained_principal=(
-                most_constrained.principal if most_constrained is not None else None
-            ),
+            most_constrained_principal=most_constrained,
             first_shortfall=(
-                rejection_map[most_constrained.principal]
-                if most_constrained is not None
-                else None
+                rejection_map[most_constrained] if most_constrained is not None else None
             ),
             principals=rows,
         )

@@ -428,6 +428,82 @@ def test_default_weight_is_one():
     }
 
 
+def test_tiny_positive_weights_not_rounded_to_zero():
+    # 回归：合法微小正权重 1e-10 / 2e-10 小于输出舍入精度（9 位小数）。
+    # 旧实现先把权重舍入为 0 再算加权 Jain -> ZeroDivisionError（HTTP 500），
+    # 理论份额也被误报为 0。权重总和/份额/短缺/Jain 必须基于未舍入权重。
+    resp = _run(
+        [{"id": "A", "capacity": 10, "refill_rate": 0}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "a", "weight": 1e-10},
+            {"id": "r2", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "b", "weight": 2e-10},
+        ],
+        window_seconds=10,
+    )
+    g = resp.global_report
+    # 实际获得量 (1,1)、权重 (1e-10, 2e-10)：
+    # 4 / (3e-10 · (1/1e-10 + 1/2e-10)) = 4 / 4.5 = 8/9
+    assert g.allowed_consumption == 1 + 1
+    assert g.weighted_jain_index == pytest.approx(8 / 9, abs=1e-9)
+    a, b = _principal(g, "a"), _principal(g, "b")
+    # 响应保留权重的有效数值，不被舍成 0
+    assert a.weight == 1e-10 and b.weight == 2e-10
+    # 总消耗 2：a 份额 2×1/3=2/3（已拿 1，无短缺）；b 份额 2×2/3=4/3（短缺 1/3）
+    assert a.theoretical_share == pytest.approx(2 / 3, abs=1e-9)
+    assert b.theoretical_share == pytest.approx(4 / 3, abs=1e-9)
+    assert a.deficit == 0 and a.deficit_ratio == 0
+    assert b.deficit == pytest.approx(1 / 3, abs=1e-9)
+    assert b.deficit_ratio == pytest.approx(0.25, abs=1e-9)
+    assert g.most_constrained_principal is None
+    # 逐窗口报告同口径
+    w = _window(resp, 0)
+    assert w.weighted_jain_index == pytest.approx(8 / 9, abs=1e-9)
+    assert _principal(w, "a").weight == 1e-10
+    assert _principal(w, "b").theoretical_share == pytest.approx(4 / 3, abs=1e-9)
+
+
+def test_tiny_weights_all_starved_index_is_zero():
+    # 微小权重下全部获得量为 0 时指数定义为 0（不因权重小而异常或误判）
+    resp = _run(
+        [{"id": "A", "capacity": 10, "refill_rate": 0, "initial": 0}],
+        [
+            {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "a", "weight": 1e-10},
+            {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "b", "weight": 2e-10},
+        ],
+        window_seconds=10,
+    )
+    g = resp.global_report
+    assert g.allowed_consumption == 0
+    assert g.weighted_jain_index == 0
+    a, b = _principal(g, "a"), _principal(g, "b")
+    assert a.weight == 1e-10 and b.weight == 2e-10
+    assert a.theoretical_share == 0 and b.theoretical_share == 0
+    # 彻底短缺：被拒主体短缺比例按 1 处理，首个被拒的 a 为最受限
+    assert g.most_constrained_principal == "a"
+    assert g.first_shortfall.request_id == "r1"
+    assert _window(resp, 0).weighted_jain_index == 0
+
+
+def test_tiny_inconsistent_weights_rejected_by_real_value():
+    # 回归：同一主体 1e-10 vs 2e-10，绝对差 1e-10 < 旧固定容差 EPS=1e-9，
+    # 旧实现误判一致放行；须按权重真实数值返回定位到请求 weight 的 422。
+    with pytest.raises(RequestValidationErrors) as exc:
+        FairnessReportRequest.model_validate(
+            {
+                "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+                "requests": [
+                    {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+                    {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "p", "weight": 2e-10},
+                ],
+                "window_seconds": 1,
+            }
+        )
+    errors = [e for e in exc.value.errors if e["type"] == "inconsistent_principal_weight"]
+    assert len(errors) == 1
+    assert errors[0]["loc"] == ("requests", 1, "weight")
+    assert errors[0]["input"] == 2e-10
+
+
 # ---------- 校验 ----------
 
 def test_principal_must_be_nonempty_string():
@@ -607,6 +683,46 @@ def test_http_inconsistent_weight_is_422():
         e["type"] == "inconsistent_principal_weight"
         for e in response.json()["detail"]
     )
+
+
+def test_http_tiny_weights_ok_and_tiny_weight_mismatch_is_422():
+    # 微小正权重合法：不得 500，权重/份额/指数按真实数值返回
+    response = client.post(
+        "/fairness-report",
+        json={
+            "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+            "requests": [
+                {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "a", "weight": 1e-10},
+                {"id": "r2", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "b", "weight": 2e-10},
+            ],
+            "window_seconds": 10,
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    g = data["global_report"]
+    weights = {p["principal"]: p["weight"] for p in g["principals"]}
+    assert weights == {"a": 1e-10, "b": 2e-10}
+    assert g["weighted_jain_index"] == pytest.approx(8 / 9, abs=1e-9)
+    assert data["window_reports"][0]["weighted_jain_index"] == pytest.approx(8 / 9, abs=1e-9)
+
+    # 同一主体两个不同微小权重：固定绝对容差会漏判，真实数值比较须返回 422
+    mismatch = client.post(
+        "/fairness-report",
+        json={
+            "buckets": [{"id": "A", "capacity": 10, "refill_rate": 0}],
+            "requests": [
+                {"id": "r1", "timestamp": 0, "cost": 1, "chain": ["A"], "principal": "p", "weight": 1e-10},
+                {"id": "r2", "timestamp": 1, "cost": 1, "chain": ["A"], "principal": "p", "weight": 2e-10},
+            ],
+            "window_seconds": 10,
+        },
+    )
+    assert mismatch.status_code == 422
+    errors = mismatch.json()["detail"]
+    hit = next(e for e in errors if e["type"] == "inconsistent_principal_weight")
+    assert hit["loc"] == ["requests", 1, "weight"]
+    assert hit["input"] == 2e-10
 
 
 def test_http_missing_principal_is_422():

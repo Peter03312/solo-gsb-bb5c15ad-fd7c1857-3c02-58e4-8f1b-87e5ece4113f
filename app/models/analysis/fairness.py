@@ -9,7 +9,7 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from app.errors import RequestValidationErrors
-from app.models.common import EPS, _is_finite_number
+from app.models.common import _is_finite_number
 from app.models.analysis.usage import WindowRange
 from app.models.simulation.core import (
     BucketSpec,
@@ -30,7 +30,14 @@ class FairnessSimRequest(BaseModel):
     ]
     weight: Annotated[
         float,
-        Field(default=1.0, description="主体权重，必须为正的有限数值；缺省为 1.0"),
+        Field(
+            default=1.0,
+            description=(
+                "主体权重，必须为正的有限数值；缺省为 1.0。"
+                "同一 principal 的权重须一致，按真实数值比较（不使用绝对容差），"
+                "不一致返回 422 inconsistent_principal_weight"
+            ),
+        ),
     ] = 1.0
 
     @field_validator("timestamp", mode="before")
@@ -108,20 +115,23 @@ class FairnessReportRequest(BaseModel):
     def _cross_validate(self):
         errors = _simulate_cross_validation_errors(self.buckets, self.requests)
 
-        # 同一 principal 的权重必须一致：加权 Jain 指数以主体为单位计算
+        # 同一 principal 的权重必须一致：加权 Jain 指数以主体为单位计算。
+        # 按 float 真实数值逐位比较，不使用固定绝对容差——微小权重（如 1e-10
+        # 与 2e-10）的绝对差可能小于 EPS，容差比较会把真实存在的差异误判为一致。
         principal_weight: dict[str, float] = {}
         for r_index, request in enumerate(self.requests):
             previous = principal_weight.get(request.principal)
+            current = float(request.weight)
             if previous is None:
-                principal_weight[request.principal] = float(request.weight)
-            elif abs(previous - float(request.weight)) > EPS:
+                principal_weight[request.principal] = current
+            elif previous != current:
                 errors.append(
                     {
                         "type": "inconsistent_principal_weight",
                         "loc": ("requests", r_index, "weight"),
                         "msg": (
                             f"principal {request.principal!r} 的权重不一致："
-                            f"{previous} 与 {float(request.weight)}"
+                            f"{previous} 与 {current}"
                         ),
                         "input": request.weight,
                     }
@@ -136,7 +146,10 @@ class FairnessPrincipalRow(BaseModel):
     """单个主体在某个统计范围（全局或单个窗口）内的公平性数据。"""
 
     principal: Annotated[str, Field(description="主体标识")]
-    weight: Annotated[float, Field(description="主体权重")]
+    weight: Annotated[
+        float,
+        Field(description="主体权重（请求给出的未舍入原值；合法微小正权重保持有效）"),
+    ]
     request_count: Annotated[int, Field(description="该范围内该主体的请求总数")]
     allowed_count: Annotated[int, Field(description="放行请求数")]
     rejected_count: Annotated[int, Field(description="被原子拒绝的请求数")]
@@ -184,7 +197,8 @@ class FairnessScopeReport(BaseModel):
         Field(
             description=(
                 "加权 Jain 公平指数 = (Σ x)² / (Σ w · Σ x²/w)，"
-                "x 为主体实际获得量、w 为权重；取值 (0, 1]，越大越公平"
+                "x 为主体未舍入的实际获得量、w 为未舍入的正权重；"
+                "取值 (0, 1]，越大越公平；仅当该范围实际获得量合计为 0 时定义为 0"
             )
         ),
     ]

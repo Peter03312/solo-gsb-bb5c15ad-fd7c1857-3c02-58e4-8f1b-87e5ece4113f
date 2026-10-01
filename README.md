@@ -395,20 +395,20 @@ docker compose up --build
 | --- | --- | --- |
 | `id` / `timestamp` / `cost` / `chain` | 是 | 同 `/simulate` |
 | `principal` | 是 | 请求归属主体（租户/用户/调用方 ID），非空字符串 |
-| `weight` | 否 | 主体权重，必须为正的有限数值，缺省为 `1.0`；同一 `principal` 的权重在整个请求序列中必须一致，否则返回 422（`inconsistent_principal_weight`） |
+| `weight` | 否 | 主体权重，必须为正的有限数值，缺省为 `1.0`；同一 `principal` 的权重在整个请求序列中必须一致，否则返回 422（`inconsistent_principal_weight`）。权重按请求给出的**真实数值**比较，不使用固定绝对容差：`1e-10` 与 `2e-10` 即视为不一致，错误定位到后一请求的 `weight` 字段 |
 
 ### 公平性语义
 
 1. **窗口划分**：与 `/usage-report` 完全一致——以最早请求时刻 `t_start` 为原点，窗口 `k` 为半开区间 `[t_start + k·window_seconds, t_start + (k+1)·window_seconds)`，边界上的请求属于右侧窗口；逐窗口报告只统计**该窗口内出现过**的主体，全局报告覆盖全部主体（按主体首次请求的处理顺序排列）。
 2. **回放一致**：放行/拒绝判定与 `/simulate` 完全一致（时间戳升序、同刻按输入顺序；连续补充封顶 `capacity`；链上任一桶不足则全部不扣）。
 3. **实际获得量** `allowed_consumption`：主体在该范围（窗口/全局）内所有**放行**请求的 `cost` 合计——注意每个放行请求给主体计一次 `cost`，而不是链上每桶各计一次。
-4. **理论权重份额** `theoretical_share`：`该范围全部放行消耗 × weight / Σweight`，其中 `Σweight` 只对该范围内出现过的主体求和。`weight` 全部为 1 时即等份额（总消耗的 1/n）。
-5. **短缺**：`deficit = max(0, theoretical_share − allowed_consumption)`，`deficit_ratio = deficit / theoretical_share`（理论份额为 0 时为 0）。
+4. **理论权重份额** `theoretical_share`：`该范围全部放行消耗 × weight / Σweight`，其中 `Σweight` 只对该范围内出现过的主体求和。`weight` 全部为 1 时即等份额（总消耗的 1/n）。权重总和与份额一律使用请求中的**未舍入权重**计算；合法的微小正权重（如 `1e-10`，小于接口 9 位小数的输出舍入精度）仍保持有效，不会被舍成 0。响应中每个主体的 `weight` 也按请求原值返回。
+5. **短缺**：`deficit = max(0, theoretical_share − allowed_consumption)`，`deficit_ratio = deficit / theoretical_share`（理论份额为 0 时为 0）；短缺量/比例同样基于未舍入的份额与实际获得量计算，仅在展示时按输出精度舍入。
 6. **加权 Jain 公平指数** `weighted_jain_index`：
 
    $$J = \frac{(\sum_i x_i)^2}{(\sum_i w_i)\left(\sum_i \frac{x_i^2}{w_i}\right)}$$
 
-   其中 $x_i$ 为主体 $i$ 的实际获得量、$w_i$ 为其权重；取值 `(0, 1]`，各主体获得量严格按权重比例分配时为 1，越接近 0 越不公平。等权重（$w_i = 1$）时退化为经典 Jain 指数 $(\sum x_i)^2 / (n \sum x_i^2)$。该范围全部获得量为 0 时指数定义为 0。
+   其中 $x_i$ 为主体 $i$ 的实际获得量、$w_i$ 为其**未舍入**权重；取值 `(0, 1]`，各主体获得量严格按权重比例分配时为 1，越接近 0 越不公平。等权重（$w_i = 1$）时退化为经典 Jain 指数 $(\sum x_i)^2 / (n \sum x_i^2)$。**仅当**该范围实际获得量合计为 0（什么都没有被放行）时指数定义为 0；只要存在放行量，即使权重极小（如 $10^{-10}$ 量级）也按公式正常计算，不会除零。
 7. **最受限主体** `most_constrained_principal`：在该范围**有被拒请求**的主体中，取短缺比例最高者（全部主体获得量均为 0 时按彻底短缺、比例 1 处理）；短缺比例并列时取**首次拒绝时刻最早**（同刻按输入顺序）的主体。没有任何被拒且短缺的主体时为 `null`——已拿到不少于份额的主体即使后续请求被拒，也不视为受限。
 8. **首个短缺桶** `first_shortfall`：最受限主体按处理顺序的**第一个被拒请求**，给出请求 ID/下标/时间戳、链上第一个余额不足的桶 `bucket_id`、`cost` 与判定时刻该桶余额 `available`；逐窗口报告中取的是**该窗口内**的首个短缺拒绝。
 
@@ -1423,7 +1423,7 @@ docker compose up --build
 - **非法速率/容量**：`capacity <= 0`、`refill_rate < 0`、非有限数值、`initial`/`balance` 越界；
 - **未知引用**：`chain` 引用了未在 `buckets` 中定义的 ID（`unknown_bucket_ref`）；
 - **非法窗口宽度**：`window_seconds` 缺失、非有限数值或 `<= 0`（`/usage-report` 与 `/fairness-report`）；
-- **非法主体字段**（仅 `/fairness-report`）：`principal` 缺失或不是非空字符串；`weight` 非有限数值或 `<= 0`；同一 `principal` 在不同请求中权重不一致（`inconsistent_principal_weight`）；
+- **非法主体字段**（仅 `/fairness-report`）：`principal` 缺失或不是非空字符串；`weight` 非有限数值或 `<= 0`；同一 `principal` 在不同请求中权重不一致（`inconsistent_principal_weight`，按真实数值比较，`1e-10` 与 `2e-10` 这样的微小差异也会报 422，`loc` 定位到后一请求的 `weight`）；
 - **非法预留区间**：`start` / `end` 非有限数值，或 `end <= start`（仅 `/reservation-simulate`）；
 - **非法候选链**（仅 `/route-simulate`）：`chains` 为空、候选链为空、候选链内桶重复；候选链引用未定义的桶同样报 `unknown_bucket_ref`（`loc` 定位到具体候选链）；
 - **非法 deadline**（仅 `/queue-simulate`）：`deadline` 缺失、非有限数值或早于 `timestamp`；
